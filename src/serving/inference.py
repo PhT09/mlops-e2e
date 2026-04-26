@@ -1,151 +1,177 @@
 import os
+import json
+import numpy as np
 import pandas as pd
-import mlflow
+import onnxruntime as ort
 
-# === MODEL LOADING CONFIGURATION ===
-MODEL_DIR = "/app/model"
+# ---------------------------------------------------------------------------
+# Module-level constants (resolved relative to this file's location)
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_ARTIFACTS_DIR = os.path.join(_PROJECT_ROOT, "artifacts")
+
+# ---------------------------------------------------------------------------
+# SINGLETON: Load ONNX model at import time (once, not per-request)
+# ---------------------------------------------------------------------------
+_ONNX_PATH = os.path.join(_ARTIFACTS_DIR, "model.onnx")
 
 try:
-    # Load the trained XGBoost model in MLflow pyfunc format
-    # This ensures compatibility regardless of the underlying ML library
-    model = mlflow.pyfunc.load_model(MODEL_DIR)
-    print(f"Model loaded successfully from {MODEL_DIR}")
-except Exception as e:
-    print(f"Failed to load model from {MODEL_DIR}: {e}")
-    # Fallback for local development (OPTIONAL)
-    try:
-        # Try loading from local MLflow tracking
-        import glob
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        mlruns_pattern = os.path.join(project_root, "mlruns", "*", "*", "artifacts", "model")
-        local_model_paths = glob.glob(mlruns_pattern)
-        if local_model_paths:
-            latest_model = max(local_model_paths, key=os.path.getmtime)
-            model = mlflow.pyfunc.load_model(latest_model)
-            MODEL_DIR = latest_model
-            print(f"Fallback: Loaded model from {latest_model}")
-        else:
-            raise Exception("No model found in local mlruns")
-    except Exception as fallback_error:
-        raise Exception(f"Failed to load model: {e}. Fallback failed: {fallback_error}")
+    # CPUExecutionProvider: explicit provider list ensures deterministic behavior
+    # and avoids onnxruntime falling through to a GPU/TensorRT provider that may
+    # not be available on the serving machine.
+    _SESSION = ort.InferenceSession(
+        _ONNX_PATH,
+        providers=["CPUExecutionProvider"],
+    )
+    _INPUT_NAME = _SESSION.get_inputs()[0].name   # typically "float_input"
+    print(f"[ONNX] InferenceSession ready — {_ONNX_PATH}")
+except Exception as _e:
+    raise RuntimeError(
+        f"[ONNX] Failed to load model from '{_ONNX_PATH}'. "
+        "Run 'python scripts/run_pipeline.py' first to generate the file.\n"
+        f"Underlying error: {_e}"
+    )
 
-# === FEATURE SCHEMA LOADING ===
+# ---------------------------------------------------------------------------
+# SINGLETON: Load feature schema (exact column order from training)
+# ---------------------------------------------------------------------------
+_FEATURE_FILE = os.path.join(_ARTIFACTS_DIR, "feature_columns.json")
+
 try:
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    feature_file = os.path.join(project_root, "artifacts", "feature_columns.json")
-    import json
-    with open(feature_file) as f:
-        FEATURE_COLS = json.load(f)
-    print(f"Loaded {len(FEATURE_COLS)} feature columns from training")
-except Exception as e:
-    raise Exception(f"Failed to load feature columns from {feature_file}: {e}")
+    with open(_FEATURE_FILE) as _f:
+        FEATURE_COLS = json.load(_f)
+    print(f"[ONNX] Feature schema loaded — {len(FEATURE_COLS)} columns")
+except Exception as _e:
+    raise RuntimeError(
+        f"[ONNX] Failed to load feature columns from '{_FEATURE_FILE}': {_e}"
+    )
 
-# === FEATURE TRANSFORMATION CONSTANTS ===
+# ---------------------------------------------------------------------------
+# FEATURE TRANSFORMATION CONSTANTS
+# (kept exactly in sync with build_features.py / training pipeline)
+# ---------------------------------------------------------------------------
 
-# Deterministic binary feature mappings (consistent with training)
+# Ordinal features: deterministic integer mappings that mirror build_features.py
 ORDINAL_MAP = {
-    'year': {'1st': 1, '2nd': 2, '3rd': 3, '4th': 4},
-    'stress_level': {'Low': 0, 'Medium': 1, 'High': 2},
-    'sleep_quality': {'Poor': 0, 'Average': 1, 'Good': 2},
-    'internet_quality': {'Poor': 0, 'Average': 1, 'Good': 2},
+    "year":             {"1st": 1, "2nd": 2, "3rd": 3, "4th": 4},
+    "stress_level":     {"Low": 0, "Medium": 1, "High": 2},
+    "sleep_quality":    {"Poor": 0, "Average": 1, "Good": 2},
+    "internet_quality": {"Poor": 0, "Average": 1, "Good": 2},
 }
 
-NOMINAL_COLS = ['gender', 'course']
+# Nominal (one-hot encoded) features — must match pd.get_dummies(drop_first=True)
+NOMINAL_COLS = ["gender", "course"]
 
-# Numeric columns that need type coercion
+# Numeric features that may arrive as strings from external JSON payloads
 NUMERIC_COLS = [
-    "age", 
-    "daily_study_hours", 
-    "daily_sleep_hours", 
-    "screen_time_hours", 
-    "physical_activity_hours", 
-    "anxiety_score", 
-    "depression_score", 
-    "academic_pressure_score", 
-    "financial_stress_score", 
-    "social_support_score", 
-    "cgpa", 
-    "attendance_percentage"
+    "age",
+    "daily_study_hours",
+    "daily_sleep_hours",
+    "screen_time_hours",
+    "physical_activity_hours",
+    "anxiety_score",
+    "depression_score",
+    "academic_pressure_score",
+    "financial_stress_score",
+    "social_support_score",
+    "cgpa",
+    "attendance_percentage",
 ]
 
+# ---------------------------------------------------------------------------
+# Label mapping: ONNX returns int64 class index → human-readable string
+# ---------------------------------------------------------------------------
+_LABEL_MAP = {0: "Low Burnout Risk", 1: "Medium Burnout Risk", 2: "High Burnout Risk"}
+
+
+# ---------------------------------------------------------------------------
+# Internal transformation (mirrors training pipeline — do not change lightly)
+# ---------------------------------------------------------------------------
 def _serve_transform(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply the same feature engineering steps used during training.
+
+    This function MUST stay in sync with ``src/features/build_features.py``
+    and the preprocessing done in ``scripts/run_pipeline.py``.  Any drift
+    between the two will silently degrade model accuracy.
+    """
     df = df.copy()
-    
-    # Clean column names (remove any whitespace)
+
+    # Strip accidental whitespace from column names (defensive)
     df.columns = df.columns.str.strip()
-    
-    # === STEP 1: Numeric Type Coercion ===
-    # Ensure numeric columns are properly typed (handle string inputs)
+
+    # --- STEP 1: Numeric coercion ---
+    # Inputs arrive as JSON strings from FastAPI; coerce to float and fill NaN.
     for c in NUMERIC_COLS:
         if c in df.columns:
-            # Convert to numeric, replacing invalid values with NaN
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-            # Fill NaN with 0 (same as training preprocessing)
-            df[c] = df[c].fillna(0)
-    
-    # === STEP 2: Binary Feature Encoding ===
-    # Apply deterministic mappings for binary features
-    # CRITICAL: Must use exact same mappings as training
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    # --- STEP 2: Ordinal encoding ---
+    # Apply deterministic integer mappings (identical to build_features.py)
     for c, mapping in ORDINAL_MAP.items():
         if c in df.columns:
             df[c] = (
                 df[c]
-                .astype(str)                    # Convert to string
-                .str.strip()                    # Remove whitespace
-                .map(mapping)                   # Apply binary mapping
-                .astype("Int64")                # Handle NaN values
-                .fillna(0)                      # Fill unknown values with 0
-                .astype(int)                    # Final integer conversion
+                .astype(str)
+                .str.strip()
+                .map(mapping)
+                .astype("Int64")    # nullable int so .map() NaNs are preserved
+                .fillna(0)
+                .astype(int)
             )
-    
-    # === STEP 3: One-Hot Encoding for Nominal Features ===
+
+    # --- STEP 3: One-hot encoding for nominal features ---
+    # drop_first=True mirrors training; column names must match FEATURE_COLS
     df = pd.get_dummies(df, columns=NOMINAL_COLS, drop_first=True)
-    
-    # === STEP 4: Boolean to Integer Conversion ===
-    # Convert any boolean columns to integers (XGBoost compatibility)
+
+    # --- STEP 4: Boolean → integer (XGBoost / ONNX require numeric arrays) ---
     bool_cols = df.select_dtypes(include=["bool"]).columns
     if len(bool_cols) > 0:
         df[bool_cols] = df[bool_cols].astype(int)
-    
-    # === STEP 5: Feature Alignment with Training Schema ===
-    # Missing features get filled with 0, extra features are dropped
+
+    # --- STEP 5: Align with training feature schema ---
+    # Missing OHE columns (unseen categories) are filled with 0.
+    # Extra unexpected columns are dropped silently.
     df = df.reindex(columns=FEATURE_COLS, fill_value=0)
-    
+
     return df
 
+
+# ---------------------------------------------------------------------------
+# Public API — must NOT change (src/app/main.py depends on this signature)
+# ---------------------------------------------------------------------------
 def predict(input_dict: dict) -> str:
-    # === STEP 1: Convert Input to DataFrame ===
-    # Create single-row DataFrame for pandas transformations
+    """
+    Transform raw input and return a burnout risk label.
+
+    Parameters
+    ----------
+    input_dict : dict
+        Raw key-value pairs from the FastAPI request (Pydantic .dict()).
+
+    Returns
+    -------
+    str
+        One of: "Low Burnout Risk", "Medium Burnout Risk", "High Burnout Risk".
+    """
+    # -- 1. Wrap in a single-row DataFrame --
     df = pd.DataFrame([input_dict])
-    
-    # === STEP 2: Apply Feature Transformations ===
-    # Use the same transformation pipeline as training
+
+    # -- 2. Apply feature engineering (ordinal + OHE + alignment) --
     df_enc = _serve_transform(df)
-    
-    # === STEP 3: Generate Model Prediction ===
-    # Call the loaded MLflow model for inference
-    # The model returns predictions in various formats depending on the ML library
-    try:
-        preds = model.predict(df_enc)
-        
-        # Normalize prediction output to consistent format
-        if hasattr(preds, "tolist"):
-            preds = preds.tolist()  # Convert numpy array to list
-            
-        # Extract single prediction value (for single-row input)
-        if isinstance(preds, (list, tuple)) and len(preds) == 1:
-            result = preds[0]
-        else:
-            result = preds
-            
-    except Exception as e:
-        raise Exception(f"Model prediction failed: {e}")
-    
-    # === STEP 4: Convert to Business-Friendly Output ===
-    # Convert multiclass prediction (0/1/2) to actionable language
-    if result == 2:
-        return "High Burnout Risk"
-    elif result == 1:
-        return "Medium Burnout Risk"
-    else:
-        return "Low Burnout Risk"
+
+    # -- 3. Cast to float32 BEFORE handing to ONNX --
+    # WHY float32:  The ONNX graph was compiled with FloatTensorType (= float32).
+    # onnxruntime enforces strict type matching and will raise an InvalidArgument
+    # error if the input dtype is float64 (numpy default) or int.  Explicit cast
+    # here prevents silent type promotion inside the C++ runtime.
+    X = df_enc.values.astype(np.float32)
+
+    # -- 4. Run ONNX inference --
+    # session.run() returns [labels, probabilities] because zipmap=False was set
+    # in export_onnx.py.  labels has shape (n_rows,) with dtype int64.
+    outputs = _SESSION.run(None, {_INPUT_NAME: X})
+    class_idx = int(outputs[0][0])   # scalar int for the single input row
+
+    # -- 5. Map class index to business label --
+    return _LABEL_MAP.get(class_idx, "Unknown Burnout Risk")

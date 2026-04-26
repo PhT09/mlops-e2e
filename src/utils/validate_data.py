@@ -53,9 +53,9 @@ def validate_student_data(df) -> Tuple[bool, List[str]]:
     success = len(failed_expectations) == 0
     
     if success:
-        print("✅ Data validation PASSED")
+        print("Data validation PASSED")
     else:
-        print(f"❌ Data validation FAILED: {len(failed_expectations)} checks failed")
+        print(f"Data validation FAILED: {len(failed_expectations)} checks failed")
         print(f"   Failed expectations: {failed_expectations}")
     
     return success, failed_expectations

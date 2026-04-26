@@ -2,7 +2,6 @@ import os
 import sys
 import time
 import argparse
-import pandas as pd
 import mlflow
 import mlflow.sklearn
 from posthog import project_root
@@ -11,7 +10,6 @@ from sklearn.metrics import (
     classification_report, precision_score, recall_score,
     f1_score, roc_auc_score
 )
-from xgboost import XGBClassifier
 
 # === Fix import path for local modules ===
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -21,6 +19,9 @@ from src.data.load_data import load_data                   # Data loading with e
 from src.data.preprocess_data import preprocess_data            # Basic data cleaning
 from src.features.build_features import build_features     # Feature engineering (CRITICAL for model performance)
 from src.utils.validate_data import validate_student_data    # Data quality validation
+from src.models.train import train_xgboost                 # Model training
+from src.models.evalutate import evaluate_model            # Model evaluation
+from src.models.export_onnx import export_to_onnx          # ONNX export for serving
 
 def main(args):    
     # === MLflow Setup ===
@@ -59,12 +60,12 @@ def main(args):
         df = preprocess_data(df)  # Basic cleaning (handle missing values, fix data types)
 
         # Save processed dataset for reproducibility and debugging
-        processed_path = os.path.join(project_root, "data", "processed", "telco_churn_processed.csv")
+        processed_path = os.path.join(project_root, "data", "processed", "student_mental_health_burnout_processed.csv")
         os.makedirs(os.path.dirname(processed_path), exist_ok=True)
         df.to_csv(processed_path, index=False)
         print(f"Processed dataset saved to {processed_path} | Shape: {df.shape}")
 
-        # === STAGE 3: Feature Engineering - CRITICAL for Model Performance ===
+        # === STAGE 3: Feature Engineering ===
         print("Building features...")
         target = args.target
         if target not in df.columns:
@@ -77,8 +78,7 @@ def main(args):
             df_enc[c] = df_enc[c].astype(int)
         print(f"Feature engineering completed: {df_enc.shape[1]} features")
 
-        # === CRITICAL: Save Feature Metadata for Serving Consistency ===
-        # This ensures serving pipeline uses exact same features in exact same order
+        # === Save Feature Metadata for Serving Consistency ===
         import json, joblib
         artifacts_dir = os.path.join(project_root, "artifacts")
         os.makedirs(artifacts_dir, exist_ok=True)
@@ -120,46 +120,25 @@ def main(args):
         # === STAGE 5: Model Training with Optimized Hyperparameters ===
         print("Training XGBoost model...")
         
-        # These hyperparameters were optimized through hyperparameter tuning
-        model = XGBClassifier(
-            # Tree structure parameters
-            n_estimators=301,        # Number of trees (OPTIMIZED)
-            learning_rate=0.034,     # Step size shrinkage (OPTIMIZED)  
-            max_depth=7,            # Maximum tree depth (OPTIMIZED)
-            
-            # Regularization parameters
-            subsample=0.95,         # Sample ratio of training instances
-            colsample_bytree=0.98,  # Sample ratio of features for each tree
-            
-            # Performance parameters
-            n_jobs=-1,              # Use all CPU cores
-            random_state=42,        # Reproducible results
-            eval_metric="logloss",  # Evaluation metric
-            )
+        model, train_time = train_xgboost(X_train, y_train)
 
-        # === Train Model and Track Training Time ===
-        t0 = time.time()
-        model.fit(X_train, y_train)
-        train_time = time.time() - t0
         mlflow.log_metric("train_time", train_time)  # Track training performance
         print(f"Model trained in {train_time:.2f} seconds")
 
         # === STAGE 6: Model Evaluation ===
         print("Evaluating model performance...")
         
-        # Generate predictions and track inference time
-        t1 = time.time()
-        y_pred = model.predict(X_test)
-        pred_time = time.time() - t1
+        # Generate predictions and metrics
+        y_pred, metrics = evaluate_model(model, X_test, y_test)
+        
+        pred_time = metrics["pred_time"]
         mlflow.log_metric("pred_time", pred_time)  # Track inference performance
 
         # === Log Evaluation Metrics to MLflow ===
-        precision = precision_score(y_test, y_pred, average="weighted")    # Of predicted churners, how many actually churned?
-        recall = recall_score(y_test, y_pred, average="weighted")          # Of actual churners, how many did we catch?
-        f1 = f1_score(y_test, y_pred, average="weighted")                  # Harmonic mean of precision and recall
-        
-        y_prob = model.predict_proba(X_test)
-        roc_auc = roc_auc_score(y_test, y_prob, average="weighted", multi_class="ovr")         # Area under ROC curve (threshold-independent)
+        precision = metrics["precision"]
+        recall = metrics["recall"]
+        f1 = metrics["f1"]
+        roc_auc = metrics["roc_auc"]
         
         # Log all metrics for experiment tracking
         mlflow.log_metric("precision", precision)
@@ -171,14 +150,32 @@ def main(args):
         print(f"   Precision: {precision:.3f} | Recall: {recall:.3f}")
         print(f"   F1 Score: {f1:.3f} | ROC AUC: {roc_auc:.3f}")
 
-        # === STAGE 7: Model Serialization and Logging ===
-        print("Saving model to MLflow...")
-        # Log model in MLflow's standard format for serving
+        # === STAGE 7: Log sklearn model to MLflow (kept for experiment UI) ===
+        # We still log the native sklearn/XGBoost model here so that:
+        #   - MLflow UI shows a fully-runnable model artefact for ad-hoc inference
+        #   - Experiment comparisons can use mlflow.sklearn.load_model() in notebooks
+        # The model is NOT used by the FastAPI layer (ONNX handles serving instead).
+        print("Saving sklearn model to MLflow (experiment tracking)...")
         mlflow.sklearn.log_model(
-            model, 
-            artifact_path="model"  # This creates a 'model/' folder in MLflow run artifacts
+            model,
+            artifact_path="model"  # Creates a 'model/' folder in MLflow run artifacts
         )
-        print("Model saved to MLflow for serving pipeline")
+        print("Sklearn model logged to MLflow for experiment UI")
+
+        # === STAGE 8: Export model to ONNX (used by FastAPI serving layer) ===
+        # WHY a separate ONNX export?
+        #   The FastAPI inference layer (src/serving/inference.py) loads model.onnx
+        #   via onnxruntime, which is a lightweight C++ runtime that requires no
+        #   MLflow, sklearn, or XGBoost at serve time.  This reduces the container
+        #   image footprint and gives ~2–5x faster cold-start than pyfunc.load_model.
+        print("Exporting model to ONNX format for FastAPI serving...")
+        onnx_path = export_to_onnx(
+            model=model,
+            n_features=X_train.shape[1],   # Pin input width in the ONNX graph
+            artifacts_dir=artifacts_dir,
+            mlflow_artifact_path="onnx_model",
+        )
+        print(f"ONNX model ready for serving at: {onnx_path}")
 
         # === Final Performance Summary ===
         print(f"\n⏱Performance Summary:")
@@ -193,7 +190,7 @@ def main(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Run churn pipeline with XGBoost + MLflow")
     p.add_argument("--input", type=str, required=True,
-                   help="path to CSV (e.g., data/raw/Telco-Customer-Churn.csv)")
+                   help="path to CSV (e.g., data/raw/Telco-Customer-Churn.csv")
     p.add_argument("--target", type=str, default="Churn")
     p.add_argument("--test_size", type=float, default=0.2)
     p.add_argument("--experiment", type=str, default="Telco Churn")
