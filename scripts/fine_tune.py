@@ -1,9 +1,24 @@
+"""Fine-tuning script for LightGBM models using MLflow.
+
+This script loads a previously trained LightGBM model from MLflow and fine-tunes
+it on new data. LightGBM supports incremental training via the init_model parameter,
+which allows adding new trees to an existing booster without starting from scratch.
+
+Usage:
+------
+# Using fixed learning rate:
+python scripts/fine_tune.py --input data/raw/student_data.csv --target burnout_level --learning_rate 0.01
+
+# Using Optuna to find hyperparameters:
+python scripts/fine_tune.py --input data/raw/student_data.csv --target burnout_level --tune --n_trials 20
+"""
+
 import os
 import sys
 import time
 import argparse
 import mlflow
-import mlflow.sklearn
+import mlflow.lightgbm
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     classification_report, precision_score, recall_score,
@@ -18,7 +33,7 @@ sys.path.append(project_root)
 from src.data.load_data import load_data
 from src.data.preprocess_data import preprocess_data
 from src.features.build_features import build_features
-from src.models.fine_tuning import tune_pretrained_model, fine_tune_xgboost
+from src.models.fine_tuning import tune_pretrained_model, fine_tune_lightgbm
 
 def get_latest_run_id(experiment_name, client):
     """Retrieve the latest run ID from the specified MLflow experiment."""
@@ -90,12 +105,13 @@ def main(args):
         base_run_id = get_latest_run_id(args.experiment, client)
         
     model_uri = f"runs:/{base_run_id}/model"
-    print(f"Loading base model from: {model_uri}")
+    print(f"Loading base LightGBM model from: {model_uri}")
     
     try:
-        base_model = mlflow.sklearn.load_model(model_uri)
+        # Load the LightGBM model from MLflow
+        base_model = mlflow.lightgbm.load_model(model_uri)
     except Exception as e:
-        print(f"Could not load model. Ensure the path is correct and model exists. Error: {e}")
+        print(f"Could not load LightGBM model. Ensure the path is correct and model exists. Error: {e}")
         return
 
     # === Data Loading & Processing ===
@@ -115,12 +131,13 @@ def main(args):
     y = df_enc[target]
     
     # Check if features match the model's expected features
-    model_features = base_model.feature_names_in_ if hasattr(base_model, 'feature_names_in_') else None
+    # LightGBM stores feature names in feature_name_ attribute
+    model_features = base_model.feature_name_ if hasattr(base_model, 'feature_name_') else None
     if model_features is not None:
         missing_cols = set(model_features) - set(X.columns)
         if missing_cols:
             raise ValueError(f"Features missing in new data: {missing_cols}")
-        X = X[model_features] # Align column order
+        X = X[model_features]  # Align column order
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=args.test_size, stratify=y, random_state=42
@@ -130,6 +147,7 @@ def main(args):
     with mlflow.start_run(run_name="fine_tuning"):
         mlflow.log_param("base_run_id", base_run_id)
         mlflow.log_param("is_finetune", True)
+        mlflow.log_param("model_type", "lightgbm")
         mlflow.log_param("learning_rate_finetune", args.learning_rate)
 
         # Baseline evaluation (before fine-tuning)
@@ -145,27 +163,27 @@ def main(args):
             best_params = {"learning_rate": args.learning_rate}
             mlflow.log_param("learning_rate", args.learning_rate)
         
-        print("Fine-tuning model...")
-        base_model, train_time = fine_tune_xgboost(base_model, X_train, y_train, **best_params)
+        print("Fine-tuning LightGBM model...")
+        finetuned_model, train_time = fine_tune_lightgbm(base_model, X_train, y_train, **best_params)
         
         mlflow.log_metric("finetune_train_time", train_time)
         print(f"Model fine-tuned in {train_time:.2f} seconds")
 
         # Evaluation after fine-tuning
         print("Evaluating fine-tuned model...")
-        evaluate_and_log(base_model, X_test, y_test, prefix="finetuned_")
+        evaluate_and_log(finetuned_model, X_test, y_test, prefix="finetuned_")
 
         # Save the fine-tuned model
-        print("Saving fine-tuned model to MLflow...")
-        mlflow.sklearn.log_model(base_model, artifact_path="model")
+        print("Saving fine-tuned LightGBM model to MLflow...")
+        mlflow.lightgbm.log_model(finetuned_model, artifact_path="model")
         print("Fine-tuning complete. Model saved to new MLflow run.")
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Fine-tune an XGBoost MLflow model.")
+    p = argparse.ArgumentParser(description="Fine-tune a LightGBM MLflow model.")
     p.add_argument("--input", type=str, required=True, help="path to new data CSV")
     p.add_argument("--target", type=str, default="burnout_level", help="Target column. Defaults to 'burnout_level'.")
     p.add_argument("--test_size", type=float, default=0.2)
-    p.add_argument("--experiment", type=str, default="Telco Churn", help="MLflow Experiment Name")
+    p.add_argument("--experiment", type=str, default="Student Burnout Prediction", help="MLflow Experiment Name")
     p.add_argument("--run_id", type=str, default=None, help="Specific Run ID to load. If empty, loads the latest run.")
     p.add_argument("--mlflow_uri", type=str, default=None, help="MLflow Tracking URI (optional).")
     p.add_argument("--learning_rate", type=float, default=0.01, help="Learning rate for fine-tuning. Typically smaller than base.")
@@ -174,12 +192,3 @@ if __name__ == "__main__":
 
     args = p.parse_args()
     main(args)
-
-r"""
-# Example usage:
-# Using fixed learning rate:
-python scripts/fine_tune.py --input data/raw/student_data.csv --target burnout_level --learning_rate 0.01
-
-# Using Optuna to find hyperparameters:
-python scripts/fine_tune.py --input data/raw/student_data.csv --target burnout_level --tune --n_trials 20
-"""

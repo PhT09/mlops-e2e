@@ -8,7 +8,7 @@ from src.data.preprocess_data import preprocess_data
 from src.features.build_features import build_features
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-RAW = os.path.join(project_root, "data", "raw", "student_mental_health_burnout.csv")
+RAW = os.path.join(project_root, "data", "raw", "student_mental_health_burnout_relabeled.csv")
 OUT = os.path.join(project_root, "data", "processed", "student_mental_health_burnout_processed.csv")
 
 # 1) load raw

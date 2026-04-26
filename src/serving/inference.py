@@ -1,3 +1,28 @@
+"""ONNX-based inference pipeline for LightGBM student burnout prediction.
+
+This module provides a production-ready inference API that:
+1. Loads a pre-trained LightGBM model exported to ONNX format
+2. Applies the same feature engineering transformations used during training
+3. Returns human-readable burnout risk predictions
+
+Key architectural decision:
+-----------------------
+We use ONNX Runtime (not the LightGBM Python API) for inference because:
+- **Framework independence**: onnxruntime is model-agnostic and can load ONNX
+  models from any source framework (LightGBM, XGBoost, PyTorch, TensorFlow, etc.)
+  without requiring the original framework to be installed.
+- **Performance**: onnxruntime's C++ inference engine is optimized for production
+  serving and typically faster than Python-based model APIs.
+- **Deployment flexibility**: The same ONNX model can be deployed to edge devices,
+  mobile apps, or cloud services without Python dependencies.
+- **Version stability**: ONNX format provides a stable contract between training
+  and serving, reducing risks from library version mismatches.
+
+The inference code here is completely framework-agnostic — changing from LightGBM
+to another model type only requires re-exporting the ONNX file; this inference
+code remains unchanged.
+"""
+
 import os
 import json
 import numpy as np
@@ -124,7 +149,9 @@ def _serve_transform(df: pd.DataFrame) -> pd.DataFrame:
     # drop_first=True mirrors training; column names must match FEATURE_COLS
     df = pd.get_dummies(df, columns=NOMINAL_COLS, drop_first=True)
 
-    # --- STEP 4: Boolean → integer (XGBoost / ONNX require numeric arrays) ---
+    # --- STEP 4: Boolean → integer ---
+    # ONNX models expect numeric arrays; boolean columns must be cast to int.
+    # This applies to one-hot encoded dummy columns created by pd.get_dummies().
     bool_cols = df.select_dtypes(include=["bool"]).columns
     if len(bool_cols) > 0:
         df[bool_cols] = df[bool_cols].astype(int)
