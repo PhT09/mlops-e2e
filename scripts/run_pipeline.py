@@ -1,3 +1,30 @@
+"""Baseline model training pipeline with MLflow tracking.
+
+This script trains a LightGBM baseline model and logs it to MLflow.
+It does NOT export to ONNX - use scripts/export_model.py for that.
+
+Workflow:
+---------
+1. Training Phase (THIS SCRIPT):
+   - Load and preprocess data
+   - Feature engineering
+   - Train baseline LightGBM model
+   - Log to MLflow with runID: YYYYmmddHHMM_lightgbm_baseline
+   - Save feature metadata for serving
+
+2. Export Phase (scripts/export_model.py):
+   - Load model from MLflow run_id
+   - Export to ONNX
+   - Benchmark throughput
+   - Log throughput metric
+
+Usage:
+------
+python scripts/run_pipeline.py \
+    --input data/raw/student_mental_health_burnout_relabeled.csv \
+    --target burnout_level
+"""
+
 import os
 import sys
 import time
@@ -25,31 +52,77 @@ try:
     HAS_VALIDATION = True
 except ImportError:
     HAS_VALIDATION = False
-    print("⚠ Warning: great_expectations not installed. Skipping data validation.")
+    print("Warning: great_expectations not installed. Skipping data validation.")
 
 from src.models.train import train_lightgbm                # LightGBM model training
 from src.models.evalutate import evaluate_model            # Model evaluation
-from src.models.export_onnx import export_to_onnx          # ONNX export for serving
+from src.models.export_onnx import get_run_name            # Run naming utility
+
+def is_databricks_environment():
+    """Check if running in Databricks environment."""
+    return 'DATABRICKS_RUNTIME_VERSION' in os.environ
+
+def setup_mlflow_tracking(args):
+    """Configure MLflow tracking based on environment."""
+    if args.mlflow_uri:
+        # User explicitly provided tracking URI
+        mlflow.set_tracking_uri(args.mlflow_uri)
+        print(f"✓ MLflow Tracking URI: {args.mlflow_uri}")
+    elif is_databricks_environment():
+        # In Databricks, use managed MLflow (no explicit URI needed)
+        # MLflow is pre-configured and integrated with workspace
+        print("✓ Using Databricks Managed MLflow")
+        # No need to set tracking URI - Databricks handles it automatically
+    else:
+        # Local development: use file-based tracking
+        mlruns_dir = os.path.join(project_root, "mlruns")
+        os.makedirs(mlruns_dir, exist_ok=True)
+        tracking_uri = f"file://{mlruns_dir}"
+        mlflow.set_tracking_uri(tracking_uri)
+        print(f"✓ MLflow Tracking URI: {tracking_uri}")
+
+def get_experiment_name(base_name):
+    """Get proper experiment name based on environment."""
+    if is_databricks_environment():
+        # Databricks requires absolute paths for experiments
+        # Extract user email from project_root path
+        # project_root = "/Workspace/Users/<email>/mlops-e2e"
+        import re
+        match = re.search(r'/Users/([^/]+)/', project_root)
+        if match:
+            user_email = match.group(1)
+        else:
+            user_email = "default_user"
+        
+        # Return absolute path
+        return f"/Users/{user_email}/{base_name}"
+    else:
+        # Local: use simple name
+        return base_name
 
 def main(args):    
     # === MLflow Setup ===
-    # Configure MLflow to use local file-based tracking
-    
-    # Set up local tracking directory
-    if args.mlflow_uri:
-        mlflow.set_tracking_uri(args.mlflow_uri)
-    else:
-        # Use local mlruns directory in project
-        mlruns_dir = os.path.join(project_root, "mlruns")
-        os.makedirs(mlruns_dir, exist_ok=True)
-        mlflow.set_tracking_uri(f"file://{mlruns_dir}")
-    
-    mlflow.set_experiment(args.experiment)  # Creates experiment if doesn't exist
+    setup_mlflow_tracking(args)
+    # Get proper experiment name (absolute path for Databricks)
+    experiment_name = get_experiment_name(args.experiment)
+    mlflow.set_experiment(experiment_name)  # Creates experiment if doesn't exist
+    print(f"✓ Experiment: {experiment_name}")
 
-    # Start MLflow run 
-    with mlflow.start_run():
+    # Generate standardized run name: YYYYmmddHHMM_lightgbm_baseline
+    run_name = get_run_name(model_name="lightgbm", suffix="baseline")
+    
+    # Start MLflow run with standardized naming
+    with mlflow.start_run(run_name=run_name):
+        print(f"\n{'='*60}")
+        print(f"BASELINE MODEL TRAINING")
+        print(f"{'='*60}")
+        print(f"MLflow Run: {run_name}")
+        print(f"Experiment: {args.experiment}")
+        print(f"{'='*60}\n")
+        
         # === Log hyperparameters and configuration ===
         mlflow.log_param("model", "lightgbm")           # Model type for comparison
+        mlflow.log_param("model_stage", "baseline")     # Distinguish baseline from tuned
         mlflow.log_param("test_size", args.test_size)   # Train/test split ratio
 
         # === STAGE 1: Data Loading & Validation ===
@@ -68,7 +141,7 @@ def main(args):
                 import json
                 failed_path = os.path.join(project_root, "artifacts", "failed_expectations.json")
                 with open(failed_path, "w") as f:
-                    json.dump(failed, indent=2)
+                    json.dump(failed, f, indent=2)
                 raise ValueError(f"Data quality check failed. Issues: {failed}")
             else:
                 print("Data validation passed. Logged to MLflow.")
@@ -174,63 +247,64 @@ def main(args):
         print(f"   Precision: {precision:.3f} | Recall: {recall:.3f}")
         print(f"   F1 Score: {f1:.3f} | ROC AUC: {roc_auc:.3f}")
 
-        # === STAGE 7: Log LightGBM model to MLflow (kept for experiment UI) ===
-        print("Saving LightGBM model to MLflow (experiment tracking)...")
+        # === STAGE 7: Log LightGBM model to MLflow ===
+        print("Saving LightGBM model to MLflow...")
         try:
             mlflow.lightgbm.log_model(
                 model,
-                artifact_path="model"  # Creates a 'model/' folder in MLflow run artifacts
+                artifact_path="model",  # Creates a 'model/' folder in MLflow run artifacts
+                registered_model_name=None  # Don't auto-register to avoid permission issues
             )
             print("✓ LightGBM model logged to MLflow")
         except Exception as e:
             print(f"⚠ Warning: Could not log model to MLflow: {e}")
-            print("  Continuing with local ONNX export...")
+            print("  Training metrics are still logged. You can export model manually.")
+            
+            # Save model locally as fallback
+            import joblib
+            local_model_path = os.path.join(artifacts_dir, "lightgbm_model.pkl")
+            joblib.dump(model, local_model_path)
+            print(f"  ✓ Model saved locally: {local_model_path}")
 
-        # === STAGE 8: Export model to ONNX (used by FastAPI serving layer) ===
-        # The FastAPI inference layer (src/serving/inference.py) loads model.onnx
-        # from the artifacts directory for serving
-        print("Exporting model to ONNX format for FastAPI serving...")
-        onnx_path = export_to_onnx(
-            model=model,
-            n_features=X_train.shape[1],   # Pin input width in the ONNX graph
-            artifacts_dir=artifacts_dir,
-            mlflow_artifact_path=None,  # Skip MLflow logging, just save locally
-        )
-        print(f"✓ ONNX model ready for serving at: {onnx_path}")
+        # === Get current run ID ===
+        current_run = mlflow.active_run()
+        run_id = current_run.info.run_id
 
         # === Final Performance Summary ===
-        print(f"\n⏱ Performance Summary:")
-        print(f"   Training time: {train_time:.2f}s")
-        print(f"   Inference time: {pred_time:.4f}s")
-        print(f"   Samples per second: {len(X_test)/pred_time:.0f}")
-        
-        print(f"\n📊 Detailed Classification Report:")
+        print(f"\n{'='*60}")
+        print(f"BASELINE TRAINING COMPLETE")
+        print(f"{'='*60}")
+        print(f"Run ID: {run_id}")
+        print(f"Run Name: {run_name}")
+        print(f"Training time: {train_time:.2f}s")
+        print(f"Inference time: {pred_time:.4f}s")
+        print(f"Samples per second: {len(X_test)/pred_time:.0f}")
+        print(f"\nDetailed Classification Report:")
         print(classification_report(y_test, y_pred, digits=3))
-        
-        print(f"\n✅ Pipeline complete! Artifacts saved to: {artifacts_dir}")
-        print(f"   - model.onnx (ONNX model for serving)")
+        print(f"\nArtifacts saved to: {artifacts_dir}")
         print(f"   - feature_columns.json (feature schema)")
         print(f"   - preprocessing.pkl (preprocessing metadata)")
+        if os.path.exists(os.path.join(artifacts_dir, "lightgbm_model.pkl")):
+            print(f"   - lightgbm_model.pkl (model backup)")
+        print(f"\n{'='*60}")
+        print(f"NEXT STEPS:")
+        print(f"{'='*60}")
+        print(f"1. Fine-tune this model:")
+        print(f"   python scripts/fine_tune.py --run_id {run_id} --input <data>")
+        print(f"\n2. Export to ONNX for serving:")
+        print(f"   python scripts/export_model.py --run_id {run_id}")
+        print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Run student burnout prediction pipeline with LightGBM + MLflow")
+    p = argparse.ArgumentParser(description="Train baseline LightGBM model with MLflow tracking")
     p.add_argument("--input", type=str, required=True,
                    help="path to CSV (e.g., data/student_mental_health_burnout.csv)")
     p.add_argument("--target", type=str, default="burnout_level")
     p.add_argument("--test_size", type=float, default=0.2)
     p.add_argument("--experiment", type=str, default="Student Burnout Prediction")
     p.add_argument("--mlflow_uri", type=str, default=None,
-                    help="override MLflow tracking URI, else uses project_root/mlruns")
+                    help="override MLflow tracking URI (not needed in Databricks)")
 
     args = p.parse_args()
     main(args)
-
-r"""
-# Use this below to run the pipeline:
-
-python scripts/run_pipeline.py \
-    --input data/raw/student_mental_health_burnout_relabeled.csv \
-    --target burnout_level
-
-"""

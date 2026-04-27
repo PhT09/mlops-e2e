@@ -1,194 +1,357 @@
-"""Fine-tuning script for LightGBM models using MLflow.
+"""
+Fine-tune a trained LightGBM model using Optuna hyperparameter search.
 
-This script loads a previously trained LightGBM model from MLflow and fine-tunes
-it on new data. LightGBM supports incremental training via the init_model parameter,
-which allows adding new trees to an existing booster without starting from scratch.
-
-Usage:
-------
-# Using fixed learning rate:
-python scripts/fine_tune.py --input data/raw/student_data.csv --target burnout_level --learning_rate 0.01
-
-# Using Optuna to find hyperparameters:
-python scripts/fine_tune.py --input data/raw/student_data.csv --target burnout_level --tune --n_trials 20
+This script:
+1. Loads a baseline model from MLflow (by run_id OR run_name)
+2. Performs optional Optuna hyperparameter tuning
+3. Logs the tuned model and comparative metrics to MLflow
 """
 
 import os
 import sys
-import time
 import argparse
+from pathlib import Path
+
+project_root = str(Path(__file__).parent.parent.absolute())
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import mlflow
 import mlflow.lightgbm
+import time
+import lightgbm as lgb
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    classification_report, precision_score, recall_score,
-    f1_score, roc_auc_score
-)
+import pandas as pd
 
-# === Fix import path for local modules ===
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(project_root)
-
-# Local modules - Core pipeline components
-from src.data.load_data import load_data
-from src.data.preprocess_data import preprocess_data
+from src.models.export_onnx import get_run_name
 from src.features.build_features import build_features
-from src.models.fine_tuning import tune_pretrained_model, fine_tune_lightgbm
+from src.utils.mlflow_helpers import resolve_run_id, print_run_info
 
-def get_latest_run_id(experiment_name, client):
-    """Retrieve the latest run ID from the specified MLflow experiment."""
-    experiment = client.get_experiment_by_name(experiment_name)
-    if not experiment:
-        raise ValueError(f"Experiment '{experiment_name}' not found.")
+
+def is_databricks_environment():
+    """Check if running in Databricks."""
+    return 'DATABRICKS_RUNTIME_VERSION' in os.environ
+
+
+def get_experiment_name(base_name):
+    """Get proper experiment name for current environment."""
+    if is_databricks_environment():
+        import re
+        match = re.search(r'/Users/([^/]+)/', project_root)
+        user_email = match.group(1) if match else "default_user"
+        return f"/Users/{user_email}/{base_name}"
+    else:
+        return base_name
+
+
+def setup_mlflow_tracking(mlflow_uri):
+    """Configure MLflow tracking for environment."""
+    if mlflow_uri:
+        mlflow.set_tracking_uri(mlflow_uri)
+    elif not is_databricks_environment():
+        mlflow.set_tracking_uri(f"file://{project_root}/mlruns")
+
+
+def load_training_data(test_size=0.2, random_state=42):
+    """Load, apply feature engineering, and split training data."""
+    # Load processed data
+    data_path = os.path.join(project_root, 'data', 'processed', 'student_mental_health_burnout_processed.csv')
+    df = pd.read_csv(data_path)
     
-    runs = client.search_runs(
-        [experiment.experiment_id], 
-        order_by=["start_time desc"], 
-        max_results=1
+    # Apply feature engineering (same as baseline training)
+    df_features = build_features(df, target_col='burnout_level')
+    
+    # Split features and target
+    X = df_features.drop(columns=['burnout_level'])
+    y = df_features['burnout_level']
+    
+    # Split train/test
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=y
     )
     
-    if not runs:
-        raise ValueError(f"No runs found in experiment '{experiment_name}'.")
-        
-    return runs[0].info.run_id
+    print(f"Training samples: {len(X_train)}, Test samples: {len(X_test)}")
+    print(f"Features: {X.shape[1]}")
+    
+    return X_train, X_test, y_train, y_test
 
-def evaluate_and_log(model, X_test, y_test, prefix=""):
-    """Evaluates the model and logs metrics to MLflow."""
+
+def train_and_evaluate(X_train, y_train, X_test, y_test, model_params=None):
+    """Train LightGBM model and evaluate."""
+    # Default params if not provided
+    if model_params is None:
+        model_params = {
+            'n_estimators': 200,
+            'max_depth': 8,
+            'learning_rate': 0.1,
+            'num_leaves': 31,
+            'min_child_samples': 20,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'reg_alpha': 0.01,
+            'reg_lambda': 0.1,
+            'class_weight': 'balanced',
+            'random_state': 42,
+            'verbose': -1,
+            'n_jobs': -1
+        }
+    
+    # Ensure required params
+    model_params.setdefault('random_state', 42)
+    model_params.setdefault('verbose', -1)
+    
+    # Train
     t0 = time.time()
+    model = lgb.LGBMClassifier(**model_params)
+    model.fit(X_train, y_train)
+    train_time = time.time() - t0
+    
+    # Evaluate
     y_pred = model.predict(X_test)
-    pred_time = time.time() - t0
+    y_pred_proba = model.predict_proba(X_test)
     
-    precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
-    recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
-    f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
-    
-    try:
-        # For binary classification or if predict_proba is applicable
-        y_prob = model.predict_proba(X_test)
-        if len(set(y_test)) == 2:
-            roc_auc = roc_auc_score(y_test, y_prob[:, 1])
-        else:
-            roc_auc = roc_auc_score(y_test, y_prob, multi_class='ovr')
-    except:
-        roc_auc = 0.0
-
     metrics = {
-        f"{prefix}precision": precision,
-        f"{prefix}recall": recall,
-        f"{prefix}f1": f1,
-        f"{prefix}roc_auc": roc_auc,
-        f"{prefix}pred_time": pred_time
+        'precision': precision_score(y_test, y_pred, average='weighted', zero_division=0),
+        'recall': recall_score(y_test, y_pred, average='weighted', zero_division=0),
+        'f1': f1_score(y_test, y_pred, average='weighted', zero_division=0),
+        'roc_auc': roc_auc_score(y_test, y_pred_proba, multi_class='ovr', average='weighted'),
+        'train_time': train_time
     }
     
-    for k, v in metrics.items():
-        mlflow.log_metric(k, v)
-        
-    print(f"\nModel Performance ({prefix.strip('_')}):")
-    print(f"   Precision: {precision:.3f} | Recall: {recall:.3f}")
-    print(f"   F1 Score: {f1:.3f} | ROC AUC: {roc_auc:.3f}")
-    print(f"Detailed Classification Report:\n{classification_report(y_test, y_pred, digits=3)}")
+    return model, metrics
+
+
+def fine_tune_model(
+    base_run_identifier,
+    experiment_name,
+    tune=False,
+    n_trials=10,
+    mlflow_uri=None
+):
+    """
+    Fine-tune a trained model with optional hyperparameter search.
     
-    return metrics
-
-def main(args):    
-    # === MLflow Setup ===
-    mlruns_path = args.mlflow_uri or f"file:///{project_root.replace(chr(92), '/')}/mlruns"
-    mlflow.set_tracking_uri(mlruns_path)
-    mlflow.set_experiment(args.experiment)
-    client = mlflow.tracking.MlflowClient()
-
-    # === Fetch the base model ===
-    if args.run_id:
-        base_run_id = args.run_id
-    else:
-        print(f"Fetching latest run for experiment: {args.experiment}")
-        base_run_id = get_latest_run_id(args.experiment, client)
-        
-    model_uri = f"runs:/{base_run_id}/model"
-    print(f"Loading base LightGBM model from: {model_uri}")
+    Parameters
+    ----------
+    base_run_identifier : str
+        Either run_id (UUID) or run_name of the baseline model
+    experiment_name : str
+        Name of the MLflow experiment
+    tune : bool
+        If True, perform Optuna hyperparameter search
+    n_trials : int
+        Number of Optuna trials
+    mlflow_uri : str, optional
+        MLflow tracking URI
+    
+    Returns
+    -------
+    dict
+        Results with run_id, run_name, and performance metrics
+    """
+    # Setup MLflow
+    setup_mlflow_tracking(mlflow_uri)
+    
+    experiment_name_full = get_experiment_name(experiment_name)
+    mlflow.set_experiment(experiment_name_full)
+    
+    # Resolve run_id from run_id or run_name
+    print(f"\n{'='*60}")
+    print("RESOLVING BASELINE MODEL")
+    print(f"{'='*60}")
+    print(f"Input: {base_run_identifier}")
+    print(f"Experiment: {experiment_name_full}")
     
     try:
-        # Load the LightGBM model from MLflow
-        base_model = mlflow.lightgbm.load_model(model_uri)
-    except Exception as e:
-        print(f"Could not load LightGBM model. Ensure the path is correct and model exists. Error: {e}")
-        return
-
-    # === Data Loading & Processing ===
-    print(f"Loading fine-tuning data from {args.input}...")
-    df = load_data(args.input)
-    df = preprocess_data(df)
+        base_run_id = resolve_run_id(base_run_identifier, experiment_name_full)
+        print(f"Resolved to run_id: {base_run_id}")
+        print_run_info(base_run_id, experiment_name_full)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return None
     
-    target = args.target
-    if target not in df.columns:
-        raise ValueError(f"Target column '{target}' not found in data")
-        
-    df_enc = build_features(df, target_col=target)
-    for c in df_enc.select_dtypes(include=["bool"]).columns:
-        df_enc[c] = df_enc[c].astype(int)
-        
-    X = df_enc.drop(columns=[target])
-    y = df_enc[target]
+    # Load baseline model
+    print(f"\n{'='*60}")
+    print("LOADING BASELINE MODEL")
+    print(f"{'='*60}")
     
-    # Check if features match the model's expected features
-    # LightGBM stores feature names in feature_name_ attribute
-    model_features = base_model.feature_name_ if hasattr(base_model, 'feature_name_') else None
-    if model_features is not None:
-        missing_cols = set(model_features) - set(X.columns)
-        if missing_cols:
-            raise ValueError(f"Features missing in new data: {missing_cols}")
-        X = X[model_features]  # Align column order
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=args.test_size, stratify=y, random_state=42
-    )
-
-    # === Start Fine-tuning Run ===
-    with mlflow.start_run(run_name="fine_tuning"):
-        mlflow.log_param("base_run_id", base_run_id)
-        mlflow.log_param("is_finetune", True)
-        mlflow.log_param("model_type", "lightgbm")
-        mlflow.log_param("learning_rate_finetune", args.learning_rate)
-
-        # Baseline evaluation (before fine-tuning)
-        print("Evaluating base model on new test set...")
-        evaluate_and_log(base_model, X_test, y_test, prefix="base_")
-
-        # Use Optuna to find best parameters if requested
-        if args.tune:
-            print("\n--- Tuning Hyperparameters for Fine-Tuning ---")
-            best_params = tune_pretrained_model(base_model, X_train, y_train, n_trials=args.n_trials)
-            mlflow.log_params(best_params)
+    client = mlflow.tracking.MlflowClient()
+    base_run = client.get_run(base_run_id)
+    base_run_name = base_run.data.tags.get("mlflow.runName", "unknown")
+    
+    model_uri = f"runs:/{base_run_id}/model"
+    base_model = mlflow.lightgbm.load_model(model_uri)
+    print(f"Loaded model from: {base_run_name}")
+    
+    # Load baseline metrics
+    base_metrics = {k: v for k, v in base_run.data.metrics.items()}
+    print(f"Baseline metrics: F1={base_metrics.get('f1', 0):.3f}, "
+          f"ROC AUC={base_metrics.get('roc_auc', 0):.3f}")
+    
+    # Load data
+    print(f"\n{'='*60}")
+    print("LOADING & PREPROCESSING DATA")
+    print(f"{'='*60}")
+    X_train, X_test, y_train, y_test = load_training_data()
+    
+    # Hyperparameter tuning
+    best_params = None
+    if tune:
+        print(f"\n{'='*60}")
+        print(f"HYPERPARAMETER TUNING ({n_trials} trials)")
+        print(f"{'='*60}")
+        
+        import optuna
+        from sklearn.model_selection import cross_val_score
+        
+        def objective(trial):
+            params = {
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+                'num_leaves': trial.suggest_int('num_leaves', 20, 150),
+                'max_depth': trial.suggest_int('max_depth', 3, 15),
+                'min_child_samples': trial.suggest_int('min_child_samples', 5, 50),
+                'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+            }
+            
+            model = lgb.LGBMClassifier(**params, random_state=42, verbose=-1)
+            score = cross_val_score(model, X_train, y_train, cv=3, scoring='f1_weighted').mean()
+            return score
+        
+        study = optuna.create_study(direction='maximize')
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+        
+        best_params = study.best_params
+        print(f"\nBest parameters found:")
+        for k, v in best_params.items():
+            print(f"  {k}: {v}")
+        print(f"Best CV F1: {study.best_value:.3f}")
+    
+    # Train fine-tuned model
+    print(f"\n{'='*60}")
+    print("TRAINING FINE-TUNED MODEL")
+    print(f"{'='*60}")
+    
+    model_params = best_params if best_params else base_model.get_params()
+    run_name = get_run_name('lightgbm', 'tuned')
+    
+    with mlflow.start_run(run_name=run_name) as run:
+        # Train model
+        tuned_model, metrics = train_and_evaluate(
+            X_train, y_train, X_test, y_test,
+            model_params=model_params
+        )
+        
+        # Log parameters
+        mlflow.log_params(model_params)
+        mlflow.log_param('model_stage', 'tuned')
+        mlflow.log_param('base_run_id', base_run_id)
+        mlflow.log_param('base_run_name', base_run_name)
+        mlflow.log_param('tuning_enabled', tune)
+        
+        if best_params:
+            for k, v in best_params.items():
+                mlflow.log_param(f'best_{k}', v)
+        
+        # Log comparative metrics
+        mlflow.log_metrics({
+            'finetuned_precision': metrics['precision'],
+            'finetuned_recall': metrics['recall'],
+            'finetuned_f1': metrics['f1'],
+            'finetuned_roc_auc': metrics['roc_auc'],
+            'base_precision': base_metrics.get('precision', 0),
+            'base_recall': base_metrics.get('recall', 0),
+            'base_f1': base_metrics.get('f1', 0),
+            'base_roc_auc': base_metrics.get('roc_auc', 0),
+            'f1_improvement': metrics['f1'] - base_metrics.get('f1', 0),
+        })
+        
+        # Log model
+        mlflow.lightgbm.log_model(tuned_model, "model")
+        
+        run_id = run.info.run_id
+        
+        print(f"\n{'='*60}")
+        print("FINE-TUNING COMPLETE")
+        print(f"{'='*60}")
+        print(f"Run ID:   {run_id}")
+        print(f"Run Name: {run_name}")
+        print(f"\nBaseline Performance:")
+        print(f"  F1:      {base_metrics.get('f1', 0):.3f}")
+        print(f"  ROC AUC: {base_metrics.get('roc_auc', 0):.3f}")
+        print(f"\nFine-tuned Performance:")
+        print(f"  F1:      {metrics['f1']:.3f} ({metrics['f1'] - base_metrics.get('f1', 0):+.3f})")
+        print(f"  ROC AUC: {metrics['roc_auc']:.3f} ({metrics['roc_auc'] - base_metrics.get('roc_auc', 0):+.3f})")
+        
+        if tune:
+            print(f"\nHyperparameter tuning completed ({n_trials} trials)")
         else:
-            best_params = {"learning_rate": args.learning_rate}
-            mlflow.log_param("learning_rate", args.learning_rate)
+            print(f"\nNo hyperparameter tuning (use --tune to enable)")
         
-        print("Fine-tuning LightGBM model...")
-        finetuned_model, train_time = fine_tune_lightgbm(base_model, X_train, y_train, **best_params)
+        print(f"\n{'='*60}")
+        print("NEXT STEPS")
+        print(f"{'='*60}")
+        print(f"1. Export to ONNX:")
+        print(f"   python scripts/export_model.py --run_identifier {run_id}")
+        print(f"   OR")
+        print(f"   python scripts/export_model.py --run_identifier {run_name}")
+        print(f"\n2. Compare models in MLflow UI:")
+        print(f"   Experiment: {experiment_name_full}")
+        print(f"{'='*60}\n")
         
-        mlflow.log_metric("finetune_train_time", train_time)
-        print(f"Model fine-tuned in {train_time:.2f} seconds")
+        return {
+            'run_id': run_id,
+            'run_name': run_name,
+            'metrics': metrics,
+            'base_metrics': base_metrics
+        }
 
-        # Evaluation after fine-tuning
-        print("Evaluating fine-tuned model...")
-        evaluate_and_log(finetuned_model, X_test, y_test, prefix="finetuned_")
 
-        # Save the fine-tuned model
-        print("Saving fine-tuned LightGBM model to MLflow...")
-        mlflow.lightgbm.log_model(finetuned_model, artifact_path="model")
-        print("Fine-tuning complete. Model saved to new MLflow run.")
+def main(args):
+    """Main execution function."""
+    results = fine_tune_model(
+        base_run_identifier=args.base_run_identifier,
+        experiment_name=args.experiment_name,
+        tune=args.tune,
+        n_trials=args.n_trials,
+        mlflow_uri=args.mlflow_uri
+    )
+    
+    return results
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Fine-tune a LightGBM MLflow model.")
-    p.add_argument("--input", type=str, required=True, help="path to new data CSV")
-    p.add_argument("--target", type=str, default="burnout_level", help="Target column. Defaults to 'burnout_level'.")
-    p.add_argument("--test_size", type=float, default=0.2)
-    p.add_argument("--experiment", type=str, default="Student Burnout Prediction", help="MLflow Experiment Name")
-    p.add_argument("--run_id", type=str, default=None, help="Specific Run ID to load. If empty, loads the latest run.")
-    p.add_argument("--mlflow_uri", type=str, default=None, help="MLflow Tracking URI (optional).")
-    p.add_argument("--learning_rate", type=float, default=0.01, help="Learning rate for fine-tuning. Typically smaller than base.")
-    p.add_argument("--tune", action="store_true", help="Use Optuna to search for best fine-tuning hyperparameters")
-    p.add_argument("--n_trials", type=int, default=10, help="Number of Optuna trials if --tune is set")
 
-    args = p.parse_args()
+if __name__ == '____':
+    parser = argparse.ArgumentParser(description='Fine-tune LightGBM model')
+    parser.add_argument(
+        '--base_run_identifier',
+        type=str,
+        required=True,
+        help='Baseline model run_id (UUID) or run_name (e.g., 202604271449_lightgbm_baseline)'
+    )
+    parser.add_argument(
+        '--experiment_name',
+        type=str,
+        default='Student Burnout Prediction',
+        help='MLflow experiment name'
+    )
+    parser.add_argument(
+        '--tune',
+        action='store_true',
+        help='Enable Optuna hyperparameter tuning'
+    )
+    parser.add_argument(
+        '--n_trials',
+        type=str,
+        default=10,
+        help='Number of Optuna trials (if --tune enabled)'
+    )
+    parser.add_argument(
+        '--mlflow_uri',
+        type=str,
+        default=None,
+        help='MLflow tracking URI (auto-detected if not provided)'
+    )
+    
+    args = parser.parse_args()
     main(args)
